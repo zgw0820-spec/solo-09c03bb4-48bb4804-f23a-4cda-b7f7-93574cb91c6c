@@ -1,0 +1,29 @@
+services:
+  api-a:
+    build: .
+    image: rainfall-prob-api:latest
+    ports:
+      - "8081:8000"
+    environment:
+      RAIN_DB_PATH: /data/rainfall.db
+      RAIN_BUSY_TIMEOUT_MS: "10000"
+    volumes:
+      - rain-data:/data
+    restart: unless-stopped
+
+  api-b:
+    image: rainfall-prob-api:latest
+    build: .
+    ports:
+      - "8082:8000"
+    environment:
+      RAIN_DB_PATH: /data/rainfall.db
+      RAIN_BUSY_TIMEOUT_MS: "10000"
+    volumes:
+      - rain-data:/data
+    depends_on:
+      - api-a
+    restart: unless-stopped
+
+volumes:
+  rain-data:
