@@ -110,3 +110,9 @@ class SubmitRequest(BaseModel):
         # errors share the same JSON error envelope.
         _check_grid(self.rain, self.missing)
         return self
+
+
+class ObservationSubmitRequest(SubmitRequest):
+    """Post-event observed rainfall grid (same shape/non-negativity rules and
+    strictly increasing positive revision number as a member submission)."""
+    pass

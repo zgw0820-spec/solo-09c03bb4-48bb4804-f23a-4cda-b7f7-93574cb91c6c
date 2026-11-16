@@ -16,15 +16,19 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import time
 import uuid
 from datetime import timezone
 from typing import Any, Dict, List, Tuple
 
+import numpy as np
+
 from .db import get_conn
 from .errors import ApiError
-from .schemas import RegisterRequest, SubmitRequest
+from .schemas import ObservationSubmitRequest, RegisterRequest, SubmitRequest
 from .storage import (
+    compute_brier_scores,
     compute_probabilities,
     content_hash,
     decode_float,
@@ -38,6 +42,10 @@ from .storage import (
 # --- test hooks (disabled unless explicitly enabled; never on by default) ---
 PUBLISH_DELAY_S = float(os.environ.get("RAIN_TEST_PUBLISH_DELAY_S", "0"))
 FAIL_MARKER = os.environ.get("RAIN_TEST_FAIL_MARKER", "")
+# Separate hooks for the verification path so verification concurrency and
+# failure atomicity can be tested without disturbing the publish path.
+VERIFY_DELAY_S = float(os.environ.get("RAIN_TEST_VERIFY_DELAY_S", "0"))
+VERIFY_FAIL_MARKER = os.environ.get("RAIN_TEST_VERIFY_FAIL_MARKER", "")
 
 
 def _is_busy(exc: Exception) -> bool:
@@ -175,6 +183,391 @@ def submit_member(group_id: str, member_id: str, payload: SubmitRequest) -> Dict
         "content_hash": digest,
         "duplicate": duplicate,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Post-event observations (hourly verification input)
+# --------------------------------------------------------------------------- #
+def submit_observation(group_id: str, payload: ObservationSubmitRequest) -> Dict[str, Any]:
+    """Accept an observed-rainfall revision and pin the verification target.
+
+    The first accepted observation locks, inside the same write transaction,
+    the probability product that is current at that moment. If no current
+    product exists the upload is rejected. Subsequent member corrections never
+    alter the lock; subsequent observation revisions carry the same lock and
+    immediately invalidate the previous verification.
+    """
+    with get_conn() as conn:
+        group = _get_group(conn, group_id)
+        rain_flat, miss_flat = to_arrays(
+            payload.rain, payload.missing, group["rows"], group["cols"]
+        )
+        digest = content_hash(rain_flat, miss_flat)
+        rain_blob = encode_blob(rain_flat)
+        miss_blob = encode_blob(miss_flat)
+
+        locked_product_id: int
+        duplicate = False
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            prev = conn.execute(
+                "SELECT revision, content_hash, locked_product_id FROM observations"
+                " WHERE group_id = ? ORDER BY revision DESC LIMIT 1",
+                (group_id,),
+            ).fetchone()
+
+            if prev is not None:
+                if payload.revision < int(prev["revision"]):
+                    conn.execute("ROLLBACK")
+                    raise ApiError(
+                        409,
+                        "OBSERVATION_REVISION_CONFLICT",
+                        f"observation revision {payload.revision} is not greater than latest"
+                        f" {int(prev['revision'])}",
+                    )
+                if payload.revision == int(prev["revision"]):
+                    if prev["content_hash"] == digest:
+                        # 同版同文重送：幂等，不写新行、不动核验状态
+                        duplicate = True
+                        locked_product_id = int(prev["locked_product_id"])
+                    else:
+                        conn.execute("ROLLBACK")
+                        raise ApiError(
+                            409,
+                            "OBSERVATION_REVISION_CONTENT_CONFLICT",
+                            f"observation revision {payload.revision} already exists with"
+                            " different content (异文拒收)",
+                        )
+                else:
+                    locked_product_id = int(prev["locked_product_id"])  # lock is immutable
+            else:
+                # First observation: pin the product that is current right now.
+                current = conn.execute(
+                    "SELECT product_id FROM products WHERE group_id = ? AND is_current = 1",
+                    (group_id,),
+                ).fetchone()
+                if current is None:
+                    conn.execute("ROLLBACK")
+                    raise ApiError(
+                        404,
+                        "NO_CURRENT_PRODUCT",
+                        "cannot accept the first observation while no current probability"
+                        " product exists; publish one first",
+                    )
+                locked_product_id = int(current["product_id"])
+
+            if not duplicate:
+                conn.execute(
+                    "INSERT INTO observations"
+                    " (group_id, revision, content_hash, rain_blob, miss_blob, locked_product_id)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (group_id, payload.revision, digest, rain_blob, miss_blob, locked_product_id),
+                )
+                # A corrected observation invalidates the prior verification at
+                # once (history rows retained); the lock itself does not change.
+                conn.execute(
+                    "UPDATE verifications SET is_current = 0"
+                    " WHERE group_id = ? AND is_current = 1",
+                    (group_id,),
+                )
+            conn.execute("COMMIT")
+        except ApiError:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+    return {
+        "group_id": group_id,
+        "revision": payload.revision,
+        "content_hash": digest,
+        "duplicate": duplicate,
+        "locked_product_id": locked_product_id,
+    }
+
+
+def _load_locked_product_arrays(
+    conn, product_id: int, n_cells: int
+) -> Dict[float, Tuple[np.ndarray, np.ndarray]]:
+    """Decode every threshold row of a product into flat probability/denom arrays."""
+    out: Dict[float, Tuple[np.ndarray, np.ndarray]] = {}
+    rows = conn.execute(
+        "SELECT threshold, probability_blob, denom_blob"
+        " FROM product_thresholds WHERE product_id = ? ORDER BY threshold",
+        (product_id,),
+    ).fetchall()
+    if not rows:
+        raise ApiError(500, "COMPUTE_FAILED", f"locked product {product_id} has no threshold rows")
+    for r in rows:
+        out[float(r["threshold"])] = (
+            decode_float(r["probability_blob"], n_cells),
+            decode_int(r["denom_blob"], n_cells),
+        )
+    return out
+
+
+def run_verification(group_id: str) -> Dict[str, Any]:
+    """Compute (or return the cached) current verification for a forecast time.
+
+    Mirrors the publish concurrency design: snapshot read, slow NumPy Brier
+    computation outside the write lock, then re-validate inside a short
+    ``BEGIN IMMEDIATE`` transaction. Verification always evaluates the product
+    locked by the first observation, even if that product has since been
+    superseded by member corrections.
+    """
+    for attempt in range(1, 4):
+        with get_conn() as conn:
+            try:
+                conn.execute("BEGIN")
+                group = _get_group(conn, group_id)
+                obs = conn.execute(
+                    "SELECT revision, rain_blob, miss_blob, locked_product_id FROM observations"
+                    " WHERE group_id = ? ORDER BY revision DESC LIMIT 1",
+                    (group_id,),
+                ).fetchone()
+                if obs is None:
+                    conn.execute("ROLLBACK")
+                    raise ApiError(
+                        409,
+                        "NO_OBSERVATION",
+                        "no observed rainfall has been submitted for this forecast time",
+                    )
+                obs_revision = int(obs["revision"])
+                locked_product_id = int(obs["locked_product_id"])
+                n_cells = group["rows"] * group["cols"]
+                obs_rain = decode_float(obs["rain_blob"], n_cells)
+                obs_miss = decode_mask(obs["miss_blob"], n_cells)
+                locked = _load_locked_product_arrays(conn, locked_product_id, n_cells)
+                existing = conn.execute(
+                    "SELECT verification_id FROM verifications"
+                    " WHERE group_id = ? AND obs_revision = ? AND is_current = 1",
+                    (group_id, obs_revision),
+                ).fetchone()
+                conn.execute("COMMIT")
+            except Exception:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+
+        if existing is not None:
+            return _load_verification(int(existing["verification_id"]))
+
+        # Slow compute outside any write lock: other times keep ingesting and
+        # other verifications keep running.
+        if VERIFY_DELAY_S > 0:
+            time.sleep(VERIFY_DELAY_S)
+        if VERIFY_FAIL_MARKER and os.path.exists(VERIFY_FAIL_MARKER):
+            raise ApiError(500, "COMPUTE_FAILED", "injected verification failure (test hook)")
+        try:
+            scores = compute_brier_scores(
+                obs_rain, obs_miss, locked, group["thresholds"]
+            )
+        except ApiError:
+            raise
+        except Exception as exc:  # calculation failure must not leave half a result
+            raise ApiError(500, "COMPUTE_FAILED", f"verification computation failed: {exc}") from exc
+
+        should_retry = False
+        write_attempts = 0
+        with get_conn() as conn:
+            while True:
+                write_attempts += 1
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    latest = conn.execute(
+                        "SELECT revision, locked_product_id FROM observations"
+                        " WHERE group_id = ? ORDER BY revision DESC LIMIT 1",
+                        (group_id,),
+                    ).fetchone()
+                    if latest is None:
+                        conn.execute("ROLLBACK")
+                        raise ApiError(409, "NO_OBSERVATION", "observation disappeared before verification commit")
+                    if int(latest["revision"]) != obs_revision:
+                        # A corrected observation landed during compute: the
+                        # computed row would be stale. Retry from the new revision.
+                        conn.execute("ROLLBACK")
+                        if attempt >= 3:
+                            raise ApiError(
+                                409,
+                                "REVISION_CHANGED",
+                                "observation revision changed during verification; retry the request",
+                            )
+                        should_retry = True
+                        break
+                    if int(latest["locked_product_id"]) != locked_product_id:
+                        conn.execute("ROLLBACK")
+                        raise ApiError(
+                            500,
+                            "COMPUTE_FAILED",
+                            "locked product changed unexpectedly; verification target is immutable",
+                        )
+
+                    row = conn.execute(
+                        "SELECT verification_id, is_current FROM verifications"
+                        " WHERE group_id = ? AND obs_revision = ?",
+                        (group_id, obs_revision),
+                    ).fetchone()
+                    if row is not None and int(row["is_current"]) == 1:
+                        conn.execute("ROLLBACK")
+                        return _load_verification(int(row["verification_id"]))
+
+                    # supersede previous verifications of this group (history retained)
+                    conn.execute(
+                        "UPDATE verifications SET is_current = 0"
+                        " WHERE group_id = ? AND is_current = 1",
+                        (group_id,),
+                    )
+                    if row is not None:  # historical row for this revision: revive it
+                        verification_id = int(row["verification_id"])
+                        conn.execute(
+                            "UPDATE verifications SET is_current = 1"
+                            " WHERE verification_id = ?",
+                            (verification_id,),
+                        )
+                    else:
+                        cur = conn.execute(
+                            "INSERT INTO verifications"
+                            " (group_id, obs_revision, locked_product_id, is_current)"
+                            " VALUES (?, ?, ?, 1)",
+                            (group_id, obs_revision, locked_product_id),
+                        )
+                        verification_id = int(cur.lastrowid)
+                        conn.executemany(
+                            "INSERT INTO verification_thresholds"
+                            " (verification_id, threshold, score_blob, valid_cells)"
+                            " VALUES (?, ?, ?, ?)",
+                            [
+                                (
+                                    verification_id,
+                                    float(thr),
+                                    encode_blob(np.asarray([scores[float(thr)][0]], dtype=np.float64)),
+                                    int(scores[float(thr)][1]),
+                                )
+                                for thr in group["thresholds"]
+                            ],
+                        )
+                    conn.execute("COMMIT")
+                    return _load_verification(verification_id)
+                except ApiError:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+                except sqlite3.IntegrityError:
+                    # Another writer committed the same (group, obs_revision)
+                    # verification first: collapse to that idempotent row.
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    winner = conn.execute(
+                        "SELECT verification_id FROM verifications"
+                        " WHERE group_id = ? AND obs_revision = ?",
+                        (group_id, obs_revision),
+                    ).fetchone()
+                    if winner is not None:
+                        return _load_verification(int(winner["verification_id"]))
+                    raise
+                except Exception as exc:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    if _is_busy(exc) and write_attempts < 3:
+                        time.sleep(0.05 * write_attempts)
+                        continue
+                    if _is_busy(exc):
+                        raise ApiError(503, "DATABASE_BUSY", "database locked by another writer; retry") from exc
+                    raise
+        if should_retry:
+            continue
+
+    raise ApiError(409, "REVISION_CHANGED", "observation revisions kept changing during verification; retry")
+
+
+# --------------------------------------------------------------------------- #
+# Verification queries
+# --------------------------------------------------------------------------- #
+def _load_verification(verification_id: int) -> Dict[str, Any]:
+    with get_conn() as conn:
+        vrow = conn.execute(
+            "SELECT * FROM verifications WHERE verification_id = ?", (verification_id,)
+        ).fetchone()
+        if vrow is None:
+            raise ApiError(404, "VERIFICATION_NOT_FOUND", f"verification {verification_id} not found")
+        group = _get_group(conn, vrow["group_id"])
+        thresholds_out: List[Dict[str, Any]] = []
+        for trow in conn.execute(
+            "SELECT threshold, score_blob, valid_cells"
+            " FROM verification_thresholds WHERE verification_id = ? ORDER BY threshold",
+            (verification_id,),
+        ):
+            score_arr = decode_float(trow["score_blob"], 1)
+            score_val = float(score_arr[0])
+            thresholds_out.append(
+                {
+                    "threshold": float(trow["threshold"]),
+                    "brier_score": None if np.isnan(score_val) else score_val,
+                    "valid_cells": int(trow["valid_cells"]),
+                }
+            )
+        return {
+            "verification_id": int(vrow["verification_id"]),
+            "group_id": vrow["group_id"],
+            "forecast_time": group["forecast_time"],
+            "obs_revision": int(vrow["obs_revision"]),
+            "locked_product_id": int(vrow["locked_product_id"]),
+            "is_current": bool(vrow["is_current"]),
+            "created_at": vrow["created_at"],
+            "thresholds": thresholds_out,
+        }
+
+
+def get_current_verification(group_id: str) -> Dict[str, Any]:
+    with get_conn() as conn:
+        _get_group(conn, group_id)  # 404 on unknown group
+        row = conn.execute(
+            "SELECT verification_id FROM verifications WHERE group_id = ? AND is_current = 1",
+            (group_id,),
+        ).fetchone()
+        if row is None:
+            raise ApiError(
+                404,
+                "NO_CURRENT_VERIFICATION",
+                "no current verification for this group (submit an observation and run verification)",
+            )
+        verification_id = int(row["verification_id"])
+    return _load_verification(verification_id)
+
+
+def list_verifications(group_id: str) -> Dict[str, Any]:
+    with get_conn() as conn:
+        _get_group(conn, group_id)
+        rows = conn.execute(
+            "SELECT verification_id, obs_revision, locked_product_id, is_current, created_at"
+            " FROM verifications WHERE group_id = ? ORDER BY verification_id",
+            (group_id,),
+        ).fetchall()
+        return {
+            "group_id": group_id,
+            "verifications": [
+                {
+                    "verification_id": int(r["verification_id"]),
+                    "obs_revision": int(r["obs_revision"]),
+                    "locked_product_id": int(r["locked_product_id"]),
+                    "is_current": bool(r["is_current"]),
+                    "created_at": r["created_at"],
+                }
+                for r in rows
+            ],
+        }
+
+
+def get_verification(group_id: str, verification_id: int) -> Dict[str, Any]:
+    verification = _load_verification(verification_id)
+    if verification["group_id"] != group_id:
+        raise ApiError(
+            404, "VERIFICATION_NOT_FOUND", f"verification {verification_id} does not belong to this group"
+        )
+    return verification
 
 
 # --------------------------------------------------------------------------- #
@@ -339,6 +732,19 @@ def publish_product(group_id: str) -> Dict[str, Any]:
                     if conn.in_transaction:
                         conn.execute("ROLLBACK")
                     raise
+                except sqlite3.IntegrityError:
+                    # Another writer committed the same revision-map product
+                    # first: collapse to that idempotent row.
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    winner = conn.execute(
+                        "SELECT product_id FROM products"
+                        " WHERE group_id = ? AND revision_map = ?",
+                        (group_id, canonical),
+                    ).fetchone()
+                    if winner is not None:
+                        return _load_product(int(winner["product_id"]))
+                    raise
                 except Exception as exc:
                     if conn.in_transaction:
                         conn.execute("ROLLBACK")
@@ -487,6 +893,15 @@ def get_group_status(group_id: str) -> Dict[str, Any]:
             "SELECT product_id FROM products WHERE group_id = ? AND is_current = 1",
             (group_id,),
         ).fetchone()
+        obs = conn.execute(
+            "SELECT revision, locked_product_id, created_at FROM observations"
+            " WHERE group_id = ? ORDER BY revision DESC LIMIT 1",
+            (group_id,),
+        ).fetchone()
+        current_verif = conn.execute(
+            "SELECT verification_id FROM verifications WHERE group_id = ? AND is_current = 1",
+            (group_id,),
+        ).fetchone()
         return {
             "group_id": group_id,
             "forecast_time": group["forecast_time"],
@@ -496,6 +911,9 @@ def get_group_status(group_id: str) -> Dict[str, Any]:
             "members": out_members,
             "all_members_present": complete,
             "current_product_id": int(current["product_id"]) if current else None,
+            "latest_observation_revision": int(obs["revision"]) if obs else None,
+            "locked_product_id": int(obs["locked_product_id"]) if obs else None,
+            "current_verification_id": int(current_verif["verification_id"]) if current_verif else None,
         }
 
 

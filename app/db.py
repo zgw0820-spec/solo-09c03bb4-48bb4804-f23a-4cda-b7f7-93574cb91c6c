@@ -60,8 +60,47 @@ CREATE TABLE IF NOT EXISTS product_thresholds (
     PRIMARY KEY (product_id, threshold)
 );
 
+-- Post-event observed rainfall per forecast time (hourly verification input).
+-- locked_product_id is fixed by the FIRST accepted observation: the product
+-- that was current in that same write transaction. Later member corrections
+-- never change it (immutable verification target), and every observation
+-- revision carries the same lock.
+CREATE TABLE IF NOT EXISTS observations (
+    group_id          TEXT NOT NULL,
+    revision          INTEGER NOT NULL,
+    content_hash      TEXT NOT NULL,
+    rain_blob         BLOB NOT NULL,
+    miss_blob         BLOB NOT NULL,
+    locked_product_id INTEGER NOT NULL REFERENCES products(product_id),
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (group_id, revision)
+);
+
+-- One verification per observation revision; history rows are retained while
+-- only the row matching the latest observation revision stays is_current = 1.
+CREATE TABLE IF NOT EXISTS verifications (
+    verification_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id        TEXT NOT NULL,
+    obs_revision    INTEGER NOT NULL,
+    locked_product_id INTEGER NOT NULL REFERENCES products(product_id),
+    is_current      INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE (group_id, obs_revision)
+);
+
+CREATE TABLE IF NOT EXISTS verification_thresholds (
+    verification_id INTEGER NOT NULL REFERENCES verifications(verification_id),
+    threshold       REAL NOT NULL,
+    score_blob      BLOB NOT NULL,   -- single float64 Brier MSE; NaN when 0 valid cells
+    valid_cells     INTEGER NOT NULL,
+    PRIMARY KEY (verification_id, threshold)
+);
+
 CREATE INDEX IF NOT EXISTS idx_products_group_current
     ON products(group_id, is_current);
+
+CREATE INDEX IF NOT EXISTS idx_verif_group_current
+    ON verifications(group_id, is_current);
 """
 
 

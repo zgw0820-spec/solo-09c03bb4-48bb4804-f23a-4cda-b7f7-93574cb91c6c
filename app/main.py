@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from . import __version__
 from .db import init_db
 from .errors import ApiError
-from .schemas import RegisterRequest, SubmitRequest
+from .schemas import ObservationSubmitRequest, RegisterRequest, SubmitRequest
 from . import service
 
 app = FastAPI(
@@ -116,3 +116,48 @@ def list_products(group_id: str) -> dict:
 )
 def get_product(group_id: str, product_id: int) -> dict:
     return service.get_product(group_id, product_id)
+
+
+@app.put(
+    "/groups/{group_id}/observations",
+    tags=["verification"],
+    summary="提交/更正事后实测雨量（首次提交锁定现行概率产品）",
+)
+def submit_observation(group_id: str, payload: ObservationSubmitRequest) -> dict:
+    return service.submit_observation(group_id, payload)
+
+
+@app.post(
+    "/groups/{group_id}/verifications",
+    tags=["verification"],
+    summary="对锁定的概率产品执行逐阈值 Brier 核验",
+)
+def run_verification(group_id: str) -> dict:
+    return service.run_verification(group_id)
+
+
+@app.get(
+    "/groups/{group_id}/verifications/current",
+    tags=["verification"],
+    summary="查询当前核验（对应最新实测修订与锁定产品）",
+)
+def current_verification(group_id: str) -> dict:
+    return service.get_current_verification(group_id)
+
+
+@app.get(
+    "/groups/{group_id}/verifications",
+    tags=["verification"],
+    summary="列出该时次全部历史核验（含已失效）",
+)
+def list_verifications(group_id: str) -> dict:
+    return service.list_verifications(group_id)
+
+
+@app.get(
+    "/groups/{group_id}/verifications/{verification_id}",
+    tags=["verification"],
+    summary="按 ID 查询历史核验",
+)
+def get_verification(group_id: str, verification_id: int) -> dict:
+    return service.get_verification(group_id, verification_id)

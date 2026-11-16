@@ -81,6 +81,38 @@ def matrix_to_json(flat: np.ndarray, rows: int, cols: int) -> List[List[float | 
     return result
 
 
+def compute_brier_scores(
+    obs_rain: np.ndarray,
+    obs_miss: np.ndarray,
+    probs_by_threshold: Dict[float, Tuple[np.ndarray, np.ndarray]],
+    thresholds: Sequence[float],
+) -> Dict[float, Tuple[float, int]]:
+    """Brier mean squared error per threshold against a locked probability product.
+
+    For every threshold a cell contributes only when BOTH hold:
+      * the observed cell is valid (observation missing flag == 0);
+      * the forecast probability at that cell is non-null (product denominator > 0).
+    The observed outcome is 1 where observed rain >= threshold, else 0, and the
+    Brier score is the mean of (p - outcome)^2 over the valid cells. With zero
+    valid cells the score is NaN (serialized as JSON null) with valid_cells = 0.
+    """
+    obs_valid = obs_miss.astype(bool) == 0  # (N,)
+    out: Dict[float, Tuple[float, int]] = {}
+    for threshold in thresholds:
+        t = float(threshold)
+        prob_flat, _denom = probs_by_threshold[t]
+        prob_known = ~np.isnan(prob_flat)
+        usable = obs_valid & prob_known
+        valid_cells = int(usable.sum())
+        if valid_cells == 0:
+            out[t] = (float("nan"), 0)
+            continue
+        outcome = (obs_rain >= t).astype(np.float64)
+        sq_err = (prob_flat[usable] - outcome[usable]) ** 2
+        out[t] = (float(sq_err.mean()), valid_cells)
+    return out
+
+
 def encode_blob(arr: np.ndarray) -> bytes:
     return np.ascontiguousarray(arr).tobytes()
 
